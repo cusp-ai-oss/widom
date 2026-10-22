@@ -1,5 +1,7 @@
 # Copyright (c) 2025 CuspAI
 # All rights reserved.
+#
+# Modified in 2026: align host references and clarify calculator/result contracts.
 
 import logging
 
@@ -12,7 +14,7 @@ from .analyze import (
     analyze_widom_insertions,
 )
 from .sample_compute_energies import sample_compute_energies
-from .utils import optimize_atoms
+from .utils import create_supercell_if_needed, optimize_atoms
 
 logger = logging.getLogger(__name__)
 
@@ -38,17 +40,23 @@ def run_widom_insertion(
     MIT-licensed
 
     Args:
-        calculator: ASE calculator for energy calculations.
-        structure: ASE Atoms object representing the framework structure.
+        calculator: ASE calculator responsible for host and gas parameterization,
+            including any required charges. It must support combined structures,
+            bare hosts and a nonperiodic ASE gas molecule. Host/gas reference
+            queries are performed even in direct-interaction-energy mode.
+        structure: ASE Atoms object representing the framework structure. The input
+            object is not modified.
         gas: Name of the gas molecule to insert (e.g., 'H2', 'CO2').
         temperature: Temperature in Kelvin for the simulation.
-        model_outputs_interaction_energy: Whether the calculator outputs interaction energies directly.
+        model_outputs_interaction_energy: Whether the calculator outputs interaction
+            energies directly, using consistent host/gas reference and periodic
+            boundary conventions.
         num_insertions: Number of random insertion attempts.
         optimize_structures: Whether to optimize the structure and gas molecule before insertion.
         cutoff_distance: Minimum allowed distance between framework and gas atoms in angstroms.
         cutoff_to_com: Whether to use center of mass for distance calculations.
         min_interplanar_distance: Minimum interplanar distance before constructing a supercell, in angstroms.
-        random_seed: Seed for random number generator to ensure reproducibility.
+        random_seed: Seed for repeatable sampling within the same environment.
         min_interaction_energy: Minimum valid interaction energy for the gas molecule, in eV.
 
     Example:
@@ -75,7 +83,10 @@ def run_widom_insertion(
         >>> print(f"Heat of adsorption: {results.heat_of_adsorption:.2f} kJ/mol")
 
     Returns:
-        Results containing Henry coefficient, heat of adsorption, and other computed properties.
+        Results containing Henry coefficient, heat of adsorption, and other computed
+        properties. In total-energy mode, energy_structure is the reference energy
+        of the actual host supercell used for insertion. optimized_structure_cif
+        describes that same host, including any cell replication.
     """
     gas_atoms = molecule(gas)
 
@@ -100,6 +111,11 @@ def run_widom_insertion(
     else:
         optimized_structure = structure
         optimized_gas = gas_atoms
+
+    # Use the same host cell for combined energies and the bare-host reference.
+    # The sampler also checks the cell size, but must not expand a different
+    # structure after the reference has been chosen.
+    optimized_structure = create_supercell_if_needed(optimized_structure, min_interplanar_distance)
 
     # Run Widom insertion
     logger.info(f"Running Widom insertion with {num_insertions} insertions...")

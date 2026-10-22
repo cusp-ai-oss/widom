@@ -1,5 +1,7 @@
 # Copyright (c) 2025 CuspAI
 # All rights reserved.
+#
+# Modified in 2026: correct replicated cell preparation.
 
 from typing import Optional
 
@@ -189,7 +191,10 @@ def create_supercell_if_needed(structure: Atoms, min_interplanar_distance: float
 
     Args:
         structure: The structure to potentially expand into a supercell.
-        min_interplanar_distance: Minimum interplanar distance before constructing a supercell, in angstroms.
+        min_interplanar_distance: Minimum interplanar distance before constructing
+            a supercell, in angstroms. Replication ratios within relative 1e-12
+            of an integer are treated as that integer to make repeated
+            preparation stable against floating-point boundary noise.
 
     Returns:
         The original structure or supercell if expansion was needed.
@@ -205,7 +210,14 @@ def create_supercell_if_needed(structure: Atoms, min_interplanar_distance: float
     plane_distances = np.array([dist_a, dist_b, dist_c])
 
     # Determine supercell dimensions
-    supercell = np.ceil(min_interplanar_distance / plane_distances).astype(int)
+    ratios = min_interplanar_distance / plane_distances
+    nearest_integer = np.rint(ratios)
+    ratios = np.where(
+        np.isclose(ratios, nearest_integer, rtol=1e-12, atol=0.0),
+        nearest_integer,
+        ratios,
+    )
+    supercell = np.ceil(ratios).astype(int)
 
     if np.any(supercell > 1):
         print(
