@@ -1,9 +1,10 @@
 # Copyright (c) 2025 CuspAI
 # All rights reserved.
 #
-# Modified in 2026: correct sampling, overlap, cell, and fixed-cell optimizer handling.
+# Modified in 2026: correct sampling, overlap, cell, optimizer, and uncertainty handling.
 
 from typing import Optional
+import warnings
 
 import numpy as np
 from ase import Atoms, units
@@ -270,34 +271,71 @@ def bootstrap_ratio_std(
     denominator: np.ndarray,
     n_bootstrap: int,
     random_seed: int,
-) -> float:
-    """Calculate standard deviation of ratio estimator using bootstrap.
+) -> Optional[float]:
+    """Estimate a ratio's sampling standard error with ordinary bootstrap.
 
     Args:
-        numerator: Array of numerator values.
-        denominator: Array of denominator values.
-        n_bootstrap: Number of bootstrap samples.
-        random_seed: Seed for the random number generator.
+        numerator: Nonempty one-dimensional finite numerator observations.
+        denominator: Matching finite nonnegative denominator observations,
+            with positive total weight.
+        n_bootstrap: Number of bootstrap replicates, at least two.
+        random_seed: Seed for the bootstrap random number generator.
 
     Returns:
-        Standard deviation of the ratio estimator.
+        Sample standard deviation of the replicate ratios, or None when fewer
+        than two observations are available or a resample has zero total
+        weight. Such resamples are not discarded or redrawn.
+
+    Raises:
+        ValueError: If observations or the replicate count are unsupported.
+
+    Warns:
+        RuntimeWarning: If the ratio uncertainty cannot be estimated.
     """
+    numerator = np.asarray(numerator, dtype=float)
+    denominator = np.asarray(denominator, dtype=float)
+    if (
+        numerator.ndim != 1
+        or denominator.ndim != 1
+        or numerator.shape != denominator.shape
+        or numerator.size == 0
+    ):
+        raise ValueError("Bootstrap observations must be nonempty matching 1D arrays.")
+    if (
+        not np.isfinite(numerator).all()
+        or not np.isfinite(denominator).all()
+        or np.any(denominator < 0)
+        or not np.any(denominator > 0)
+    ):
+        raise ValueError(
+            "Bootstrap observations need finite values and nonnegative, positive-total weights."
+        )
+    if n_bootstrap < 2:
+        raise ValueError("n_bootstrap must be at least two.")
+
     n = len(numerator)
-    ratios = np.zeros(n_bootstrap)
+    if n < 2:
+        warnings.warn(
+            "Uncertainty requires at least two insertion attempts; standard errors are unavailable.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
 
+    ratios = np.empty(n_bootstrap)
     rng = np.random.default_rng(random_seed)
-
     for i in range(n_bootstrap):
-        # Generate bootstrap sample indices (with replacement)
         indices = rng.choice(n, size=n, replace=True)
-
-        # Calculate ratio for this bootstrap sample
-        num_sample = numerator[indices]
-        denom_sample = denominator[indices]
-        ratios[i] = num_sample.mean() / denom_sample.mean()
-
-    # Return standard deviation of bootstrap ratios
-    return float(np.std(ratios))
+        total_weight = denominator[indices].sum()
+        if total_weight == 0:
+            warnings.warn(
+                "Bootstrap resample has zero total weight; ratio standard error is unavailable.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return None
+        ratios[i] = numerator[indices].sum() / total_weight
+    return float(np.std(ratios, ddof=1))
 
 
 def calculate_atomic_density(atoms: Atoms) -> float:
