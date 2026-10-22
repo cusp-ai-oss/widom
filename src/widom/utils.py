@@ -1,7 +1,7 @@
 # Copyright (c) 2025 CuspAI
 # All rights reserved.
 #
-# Modified in 2026: correct sampling, molecular-center overlaps, and replicated cell preparation.
+# Modified in 2026: correct sampling, overlap, cell, and fixed-cell optimizer handling.
 
 from typing import Optional
 
@@ -209,7 +209,7 @@ def optimize_atoms(
             break
 
         # fail if the forces are too large
-        forces = filter.get_forces()  # type: ignore
+        forces = filter.get_forces() if cell_relax else opt_atoms.get_forces()  # type: ignore
         _fmax = np.sqrt((forces**2).sum(axis=1).max())
         if _fmax > 1000:
             return None
