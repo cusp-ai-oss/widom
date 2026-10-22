@@ -1,7 +1,7 @@
 # Copyright (c) 2025 CuspAI
 # All rights reserved.
 #
-# Modified in 2026: correct uniform orientation sampling and replicated cell preparation.
+# Modified in 2026: correct sampling, molecular-center overlaps, and replicated cell preparation.
 
 from typing import Optional
 
@@ -36,6 +36,17 @@ def sample_gas_positions(
     Returns:
         Array of gas positions with shape (num_insertions, num_gas_atoms, 3).
     """
+    positions, _ = _sample_gas_positions_and_centers(structure, gas, num_insertions, rng)
+    return positions
+
+
+def _sample_gas_positions_and_centers(
+    structure: Atoms,
+    gas: Atoms,
+    num_insertions: int,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return wrapped atom positions and the sampled mass centers before wrapping."""
     # Uniformly sample positions in the unit cell
     random_positions = rng.random((num_insertions, 3))
     quaternions = rng.normal(size=(num_insertions, 4))
@@ -65,7 +76,7 @@ def sample_gas_positions(
         added_gas.wrap()
         gas_positions[i] = added_gas.get_positions()
 
-    return gas_positions
+    return gas_positions, cartesian_positions
 
 
 def check_accessibility(
@@ -74,6 +85,8 @@ def check_accessibility(
     lattice_matrix: np.ndarray,
     cutoff_distance: float,
     cutoff_to_com: bool,
+    *,
+    gas_centers: np.ndarray | None = None,
 ) -> np.ndarray:
     """Check which gas insertions are accessible (non-overlapping with framework atoms).
 
@@ -83,9 +96,16 @@ def check_accessibility(
         lattice_matrix: 3x3 lattice matrix for periodic boundary conditions.
         cutoff_distance: Minimum allowed distance between framework and gas atoms.
         cutoff_to_com: Whether to use the center of mass for distance calculations.
+        gas_centers: Actual molecular mass centers, shape (num_insertions, 3).
+            Required when cutoff_to_com is True: individually wrapped atom
+            positions do not uniquely determine a molecular mass center.
 
     Returns:
         Boolean array indicating which insertions are accessible.
+
+    Raises:
+        ValueError: If center-based checking is requested without finite centers
+            of the required shape.
     """
     num_insertions, num_gas_atoms = gas_positions.shape[:2]
 
@@ -97,8 +117,11 @@ def check_accessibility(
     pbc_array = np.array([1, 1, 1], dtype=np.int64)  # Assume periodic in all directions
 
     if cutoff_to_com:
-        # If cutoff is to center of mass, calculate the center of mass for each gas insertion
-        gas_coords = np.mean(gas_positions, axis=1)
+        if gas_centers is None:
+            raise ValueError("gas_centers is required when cutoff_to_com is True.")
+        gas_coords = np.asarray(gas_centers, dtype=np.float64)
+        if gas_coords.shape != (num_insertions, 3) or not np.isfinite(gas_coords).all():
+            raise ValueError("gas_centers must be finite with shape (num_insertions, 3).")
     else:
         # Flatten gas positions to check all gas atoms at once
         # Shape: (num_insertions * num_gas_atoms, 3)

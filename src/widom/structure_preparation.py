@@ -1,5 +1,7 @@
 # Copyright (c) 2025 CuspAI
 # All rights reserved.
+#
+# Modified in 2026: retain sampled mass centers for overlap checks.
 
 """
 Common structure preparation utilities for Widom insertion.
@@ -8,7 +10,11 @@ Common structure preparation utilities for Widom insertion.
 import numpy as np
 from ase import Atoms
 
-from .utils import check_accessibility, create_supercell_if_needed, sample_gas_positions
+from .utils import (
+    _sample_gas_positions_and_centers,
+    check_accessibility,
+    create_supercell_if_needed,
+)
 
 
 def create_combined_structure(
@@ -71,7 +77,9 @@ def prepare_structures_for_insertion(
     rng = np.random.default_rng(random_seed)
 
     # Sample gas positions
-    gas_positions = sample_gas_positions(structure_supercell, gas, num_insertions, rng)
+    gas_positions, gas_centers = _sample_gas_positions_and_centers(
+        structure_supercell, gas, num_insertions, rng
+    )
 
     # Check accessibility
     framework_coords = structure_supercell.get_positions()
@@ -81,7 +89,8 @@ def prepare_structures_for_insertion(
         framework_coords,
         lattice_matrix,
         cutoff_distance,
-        cutoff_to_com
+        cutoff_to_com,
+        gas_centers=gas_centers,
     )
 
     return structure_supercell, gas_positions, is_accessible
