@@ -1,5 +1,7 @@
 # Copyright (c) 2025 CuspAI
 # All rights reserved.
+#
+# Modified in 2026: replace the seeded snapshot with an analytic control.
 
 """Integration tests for the widom package.
 
@@ -166,24 +168,42 @@ class TestWidomIntegration:
                 or results.henry_coefficient != results.henry_coefficient
             )
 
-    def test_regression(self):
-        """Test that the simulation outputs are the same as previously."""
-        calculator = LennardJones(epsilon=1, sigma=0.6)
-        structure = bulk("Si")
+    def test_constant_interaction_matches_analytic_thermodynamics(self):
+        """Check a known ensemble rather than freezing a biased pose stream."""
+        from ase import Atoms, units
+        from ase.calculators.calculator import Calculator, all_changes
+        from widom.utils import calculate_atomic_density
 
+        class ConstantInteraction(Calculator):
+            implemented_properties = ["energy"]
+
+            def calculate(self, atoms=None, properties=("energy",), system_changes=all_changes):
+                super().calculate(atoms, properties, system_changes)
+                numbers = self.atoms.numbers
+                host_count = int((numbers == 14).sum())
+                has_guest = bool((numbers == 6).any())
+                self.results = {
+                    "energy": 0.01 * host_count + (-0.05 if host_count and has_guest else 0.0)
+                }
+
+        structure = Atoms("Si2", positions=[[1, 1, 1], [2, 1, 1]], cell=[8, 8, 8], pbc=True)
         results = run_widom_insertion(
-            calculator=calculator,
-            structure=structure,
-            gas="CO2",
-            temperature=300,
-            model_outputs_interaction_energy=False,
-            num_insertions=50,  # Small number for fast testing
+            ConstantInteraction(),
+            structure,
+            "CO2",
+            300.0,
+            False,
+            num_insertions=8,
+            cutoff_distance=0.0,
             random_seed=42,
         )
-
-        # Verify basic properties
-        assert isinstance(results, WidomInsertionResults)
-        np.testing.assert_allclose(results.henry_coefficient, 9.11164668e-05, rtol=1e-5)
-        np.testing.assert_allclose(results.heat_of_adsorption, -25.3732739, rtol=1e-5)
-        np.testing.assert_allclose(results.henry_coefficient_std, 6.5887637441756e-05, rtol=1e-5)
-        np.testing.assert_allclose(results.heat_of_adsorption_std, 2.73833384, rtol=1e-5)
+        kT = units._k * 300.0 / units._e
+        expected_henry = np.exp(0.05 / kT) / (
+            units._k * units._Nav * 300.0 * calculate_atomic_density(structure)
+        )
+        expected_heat = (-0.05 * units._e - units._k * 300.0) * units._Nav * 1e-3
+        np.testing.assert_allclose(results.interaction_energies, -0.05, atol=1e-12, rtol=0)
+        np.testing.assert_allclose(results.henry_coefficient, expected_henry, rtol=1e-10)
+        np.testing.assert_allclose(results.heat_of_adsorption, expected_heat, rtol=1e-10)
+        np.testing.assert_allclose(results.henry_coefficient_std, 0.0, atol=1e-12)
+        np.testing.assert_allclose(results.heat_of_adsorption_std, 0.0, atol=1e-12)

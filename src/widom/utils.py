@@ -1,7 +1,7 @@
 # Copyright (c) 2025 CuspAI
 # All rights reserved.
 #
-# Modified in 2026: correct replicated cell preparation.
+# Modified in 2026: correct uniform orientation sampling and replicated cell preparation.
 
 from typing import Optional
 
@@ -20,25 +20,31 @@ def sample_gas_positions(
     num_insertions: int,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Sample random positions and orientations for gas molecules.
+    """Sample uniform fractional positions and uniform SO(3) orientations.
+
+    The molecule's center of mass is placed at a uniform fractional position.
+    Rotations are Haar-uniform on SO(3), generated from normalized Gaussian unit
+    quaternions. The input structure and gas are not modified.
 
     Args:
         structure: Atoms object representing the framework structure.
         gas: Atoms object representing the gas molecule to insert.
         num_insertions: Number of random insertions to perform.
-        rng: NumPy random number generator.
+        rng: NumPy random number generator. Reinitializing it with the same seed
+            reproduces samples within the same environment.
 
     Returns:
         Array of gas positions with shape (num_insertions, num_gas_atoms, 3).
     """
     # Uniformly sample positions in the unit cell
     random_positions = rng.random((num_insertions, 3))
-    random_angles = rng.random(num_insertions) * 360  # Random angles for rotation
-    random_axes = rng.random((num_insertions, 3))  # Random axes for rotation
-    random_axes /= np.linalg.norm(random_axes, axis=1, keepdims=True)
+    quaternions = rng.normal(size=(num_insertions, 4))
+    quaternions /= np.linalg.norm(quaternions, axis=1, keepdims=True)
 
     # Convert fractional coordinates to Cartesian using ASE method
     cartesian_positions = structure.cell.cartesian_positions(random_positions)
+
+    centered_positions = gas.get_positions() - gas.get_center_of_mass()
 
     # Generate all gas molecules
     gas_positions = np.zeros((num_insertions, len(gas), 3))
@@ -46,7 +52,15 @@ def sample_gas_positions(
         added_gas = gas.copy()
         added_gas.cell = structure.cell  # Use the same cell as the framework
         added_gas.pbc = structure.pbc  # Use the same periodic boundary conditions
-        added_gas.rotate(v=random_axes[i], a=random_angles[i])
+        w, x, y, z = quaternions[i]
+        rotation = np.array(
+            [
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+            ]
+        )
+        added_gas.positions = centered_positions @ rotation.T
         added_gas.translate(cartesian_positions[i])
         added_gas.wrap()
         gas_positions[i] = added_gas.get_positions()
