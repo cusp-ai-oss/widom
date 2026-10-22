@@ -1,5 +1,7 @@
 # Copyright (c) 2025 CuspAI
 # All rights reserved.
+#
+# Modified in 2026: reject unsupported estimates and mask invalid samples.
 
 """
 The code in this file is derived from
@@ -32,7 +34,7 @@ class WidomInsertionResults(BaseModel):
     energy_structure: float  # [eV]
     interaction_energies: list[float]  # [eV]
     is_accessible: list[bool]  # Guests non-overlapping with framework atoms
-    is_valid: list[bool]  # Guests with valid interaction energy (> -1.25 eV)
+    is_valid: list[bool]  # Accessible, finite energies above the configured threshold
     gas_positions: list[list[list[float]]]  # Positions of the inserted gas molecules
     optimized_structure_cif: str  # CIF string of the optimized structure
 
@@ -65,6 +67,10 @@ def analyze_widom_insertions(
 
     Returns:
         Results containing Henry coefficient, heat of adsorption, and other properties.
+
+    Raises:
+        ValueError: If no attempts or no accessible, finite, valid energy samples
+            are available to estimate adsorption heat.
     """
     if energies_are_interaction:
         interaction_energies = energies  # [eV]
@@ -73,10 +79,21 @@ def analyze_widom_insertions(
 
     num_samples = len(interaction_energies)
 
-    # If the model gives too low interaction energy, we treat it as invalid.
-    is_valid = interaction_energies > min_interaction_energy  # [eV]
-    # Set invalid energies to a large value
-    interaction_energies_valid = np.where(is_valid, interaction_energies, 1e10)  # [eV]
+    if num_samples == 0:
+        raise ValueError("At least one insertion is required for analysis.")
+
+    # Rejected poses contribute zero weight, but remain in the attempt count.
+    is_valid = (
+        np.asarray(is_accessible, dtype=bool)
+        & np.isfinite(interaction_energies)
+        & (interaction_energies > min_interaction_energy)
+    )
+    if not np.any(is_valid):
+        raise ValueError(
+            "No accessible insertions with finite, valid interaction energies; "
+            "adsorption heat cannot be estimated."
+        )
+    interaction_energies_valid = np.where(is_valid, interaction_energies, np.inf)
 
     # Calculate ensemble averages properties
     # units._e [J/eV], units._k [J/K], units._k / units._e # [eV/K]
@@ -107,10 +124,12 @@ def analyze_widom_insertions(
     boltzmann_factor_shift = np.exp(
         -interaction_energies_shift / (temperature * units._k / units._e)
     )
-    u = (interaction_energies_valid * boltzmann_factor_shift).sum() / boltzmann_factor_shift.sum()
+    # Avoid inf * 0 for rejected samples in the energy-weighted sums.
+    weighted_energy = np.where(is_valid, interaction_energies, 0.0) * boltzmann_factor_shift
+    u = weighted_energy.sum() / boltzmann_factor_shift.sum()
 
     u_std = bootstrap_ratio_std(
-        interaction_energies_valid * boltzmann_factor_shift,
+        weighted_energy,
         boltzmann_factor_shift,
         n_bootstrap=100,
         random_seed=random_seed,

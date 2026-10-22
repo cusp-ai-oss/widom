@@ -87,6 +87,10 @@ def run_widom_insertion(
         properties. In total-energy mode, energy_structure is the reference energy
         of the actual host supercell used for insertion. optimized_structure_cif
         describes that same host, including any cell replication.
+
+    Raises:
+        ValueError: If no accessible, finite, valid energy samples are available
+            to estimate adsorption heat.
     """
     gas_atoms = molecule(gas)
 
