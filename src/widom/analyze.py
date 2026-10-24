@@ -1,5 +1,7 @@
 # Copyright (c) 2025 CuspAI
 # All rights reserved.
+#
+# Modified in 2026: correct sample validity and uncertainty reporting.
 
 """
 The code in this file is derived from
@@ -20,19 +22,26 @@ from .utils import (
 
 
 class WidomInsertionResults(BaseModel):
+    """Adsorption estimates and sampling standard errors.
+
+    A standard error is None when it cannot be estimated from the available
+    attempts or bootstrap resamples. Finite errors, including zero, describe
+    observed samples and cannot rule out unsampled rare configurations.
+    """
+
     henry_coefficient: float  # [mol/kg/Pa]
-    henry_coefficient_std: float  # [mol/kg/Pa]
+    henry_coefficient_std: float | None  # [mol/kg/Pa]
     averaged_interaction_energy: float  # [eV]
-    averaged_interaction_energy_std: float  # [eV]
+    averaged_interaction_energy_std: float | None  # [eV]
     heat_of_adsorption: float  # [kJ/mol]
-    heat_of_adsorption_std: float  # [kJ/mol]
+    heat_of_adsorption_std: float | None  # [kJ/mol]
     atomic_density: float  # [kg/m³]
     total_energies: list[float]  # [eV]
     energy_gas: float  # [eV]
     energy_structure: float  # [eV]
     interaction_energies: list[float]  # [eV]
     is_accessible: list[bool]  # Guests non-overlapping with framework atoms
-    is_valid: list[bool]  # Guests with valid interaction energy (> -1.25 eV)
+    is_valid: list[bool]  # Accessible, finite energies above the configured threshold
     gas_positions: list[list[list[float]]]  # Positions of the inserted gas molecules
     optimized_structure_cif: str  # CIF string of the optimized structure
 
@@ -64,7 +73,13 @@ def analyze_widom_insertions(
         random_seed: Seed for bootstrap calculations.
 
     Returns:
-        Results containing Henry coefficient, heat of adsorption, and other properties.
+        Results containing Henry coefficient, heat of adsorption, and other
+        properties. Standard errors are None when fewer than two attempts
+        are available or the corresponding bootstrap estimate is undefined.
+
+    Raises:
+        ValueError: If no attempts or no accessible, finite, valid energy samples
+            are available to estimate adsorption heat.
     """
     if energies_are_interaction:
         interaction_energies = energies  # [eV]
@@ -73,10 +88,21 @@ def analyze_widom_insertions(
 
     num_samples = len(interaction_energies)
 
-    # If the model gives too low interaction energy, we treat it as invalid.
-    is_valid = interaction_energies > min_interaction_energy  # [eV]
-    # Set invalid energies to a large value
-    interaction_energies_valid = np.where(is_valid, interaction_energies, 1e10)  # [eV]
+    if num_samples == 0:
+        raise ValueError("At least one insertion is required for analysis.")
+
+    # Rejected poses contribute zero weight, but remain in the attempt count.
+    is_valid = (
+        np.asarray(is_accessible, dtype=bool)
+        & np.isfinite(interaction_energies)
+        & (interaction_energies > min_interaction_energy)
+    )
+    if not np.any(is_valid):
+        raise ValueError(
+            "No accessible insertions with finite, valid interaction energies; "
+            "adsorption heat cannot be estimated."
+        )
+    interaction_energies_valid = np.where(is_valid, interaction_energies, np.inf)
 
     # Calculate ensemble averages properties
     # units._e [J/eV], units._k [J/K], units._k / units._e # [eV/K]
@@ -93,11 +119,15 @@ def analyze_widom_insertions(
 
     # Estimate std dev of estimator. Is a mean, so we take the std dev of terms/sqrt(N)
     kh_std = (
-        boltzmann_factor.std()
-        / (units._k * units._Nav)
-        / temperature
-        / atomic_density
-        / np.sqrt(num_samples)
+        (
+            boltzmann_factor.std(ddof=1)
+            / (units._k * units._Nav)
+            / temperature
+            / atomic_density
+            / np.sqrt(num_samples)
+        )
+        if num_samples > 1
+        else None
     )  # [mol/kg Pa]
 
     # U = < E * exp(-E/RT) > / <exp(-E/RT)> # [eV]
@@ -107,10 +137,12 @@ def analyze_widom_insertions(
     boltzmann_factor_shift = np.exp(
         -interaction_energies_shift / (temperature * units._k / units._e)
     )
-    u = (interaction_energies_valid * boltzmann_factor_shift).sum() / boltzmann_factor_shift.sum()
+    # Avoid inf * 0 for rejected samples in the energy-weighted sums.
+    weighted_energy = np.where(is_valid, interaction_energies, 0.0) * boltzmann_factor_shift
+    u = weighted_energy.sum() / boltzmann_factor_shift.sum()
 
     u_std = bootstrap_ratio_std(
-        interaction_energies_valid * boltzmann_factor_shift,
+        weighted_energy,
         boltzmann_factor_shift,
         n_bootstrap=100,
         random_seed=random_seed,
@@ -120,7 +152,7 @@ def analyze_widom_insertions(
     qst = (u * units._e - units._k * temperature) * units._Nav * 1e-3
 
     # Std dev simple linear transformation of u_std
-    qst_std = u_std * units._e * units._Nav * 1e-3
+    qst_std = None if u_std is None else u_std * units._e * units._Nav * 1e-3
 
     cif_writer = BytesIO()
     structure.write(cif_writer, format="cif")
@@ -128,11 +160,11 @@ def analyze_widom_insertions(
 
     results = WidomInsertionResults(
         henry_coefficient=float(kh),
-        henry_coefficient_std=float(kh_std),
+        henry_coefficient_std=None if kh_std is None else float(kh_std),
         averaged_interaction_energy=float(u),
-        averaged_interaction_energy_std=float(u_std),
+        averaged_interaction_energy_std=None if u_std is None else float(u_std),
         heat_of_adsorption=float(qst),
-        heat_of_adsorption_std=float(qst_std),
+        heat_of_adsorption_std=None if qst_std is None else float(qst_std),
         atomic_density=float(atomic_density),
         total_energies=energies.tolist(),
         energy_gas=float(energy_gas),

@@ -1,7 +1,10 @@
 # Copyright (c) 2025 CuspAI
 # All rights reserved.
+#
+# Modified in 2026: correct sampling, overlap, cell, optimizer, and uncertainty handling.
 
 from typing import Optional
+import warnings
 
 import numpy as np
 from ase import Atoms, units
@@ -18,25 +21,42 @@ def sample_gas_positions(
     num_insertions: int,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Sample random positions and orientations for gas molecules.
+    """Sample uniform fractional positions and uniform SO(3) orientations.
+
+    The molecule's center of mass is placed at a uniform fractional position.
+    Rotations are Haar-uniform on SO(3), generated from normalized Gaussian unit
+    quaternions. The input structure and gas are not modified.
 
     Args:
         structure: Atoms object representing the framework structure.
         gas: Atoms object representing the gas molecule to insert.
         num_insertions: Number of random insertions to perform.
-        rng: NumPy random number generator.
+        rng: NumPy random number generator. Reinitializing it with the same seed
+            reproduces samples within the same environment.
 
     Returns:
         Array of gas positions with shape (num_insertions, num_gas_atoms, 3).
     """
+    positions, _ = _sample_gas_positions_and_centers(structure, gas, num_insertions, rng)
+    return positions
+
+
+def _sample_gas_positions_and_centers(
+    structure: Atoms,
+    gas: Atoms,
+    num_insertions: int,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return wrapped atom positions and the sampled mass centers before wrapping."""
     # Uniformly sample positions in the unit cell
     random_positions = rng.random((num_insertions, 3))
-    random_angles = rng.random(num_insertions) * 360  # Random angles for rotation
-    random_axes = rng.random((num_insertions, 3))  # Random axes for rotation
-    random_axes /= np.linalg.norm(random_axes, axis=1, keepdims=True)
+    quaternions = rng.normal(size=(num_insertions, 4))
+    quaternions /= np.linalg.norm(quaternions, axis=1, keepdims=True)
 
     # Convert fractional coordinates to Cartesian using ASE method
     cartesian_positions = structure.cell.cartesian_positions(random_positions)
+
+    centered_positions = gas.get_positions() - gas.get_center_of_mass()
 
     # Generate all gas molecules
     gas_positions = np.zeros((num_insertions, len(gas), 3))
@@ -44,12 +64,20 @@ def sample_gas_positions(
         added_gas = gas.copy()
         added_gas.cell = structure.cell  # Use the same cell as the framework
         added_gas.pbc = structure.pbc  # Use the same periodic boundary conditions
-        added_gas.rotate(v=random_axes[i], a=random_angles[i])
+        w, x, y, z = quaternions[i]
+        rotation = np.array(
+            [
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+            ]
+        )
+        added_gas.positions = centered_positions @ rotation.T
         added_gas.translate(cartesian_positions[i])
         added_gas.wrap()
         gas_positions[i] = added_gas.get_positions()
 
-    return gas_positions
+    return gas_positions, cartesian_positions
 
 
 def check_accessibility(
@@ -58,6 +86,8 @@ def check_accessibility(
     lattice_matrix: np.ndarray,
     cutoff_distance: float,
     cutoff_to_com: bool,
+    *,
+    gas_centers: np.ndarray | None = None,
 ) -> np.ndarray:
     """Check which gas insertions are accessible (non-overlapping with framework atoms).
 
@@ -67,9 +97,16 @@ def check_accessibility(
         lattice_matrix: 3x3 lattice matrix for periodic boundary conditions.
         cutoff_distance: Minimum allowed distance between framework and gas atoms.
         cutoff_to_com: Whether to use the center of mass for distance calculations.
+        gas_centers: Actual molecular mass centers, shape (num_insertions, 3).
+            Required when cutoff_to_com is True: individually wrapped atom
+            positions do not uniquely determine a molecular mass center.
 
     Returns:
         Boolean array indicating which insertions are accessible.
+
+    Raises:
+        ValueError: If center-based checking is requested without finite centers
+            of the required shape.
     """
     num_insertions, num_gas_atoms = gas_positions.shape[:2]
 
@@ -81,8 +118,11 @@ def check_accessibility(
     pbc_array = np.array([1, 1, 1], dtype=np.int64)  # Assume periodic in all directions
 
     if cutoff_to_com:
-        # If cutoff is to center of mass, calculate the center of mass for each gas insertion
-        gas_coords = np.mean(gas_positions, axis=1)
+        if gas_centers is None:
+            raise ValueError("gas_centers is required when cutoff_to_com is True.")
+        gas_coords = np.asarray(gas_centers, dtype=np.float64)
+        if gas_coords.shape != (num_insertions, 3) or not np.isfinite(gas_coords).all():
+            raise ValueError("gas_centers must be finite with shape (num_insertions, 3).")
     else:
         # Flatten gas positions to check all gas atoms at once
         # Shape: (num_insertions * num_gas_atoms, 3)
@@ -170,7 +210,7 @@ def optimize_atoms(
             break
 
         # fail if the forces are too large
-        forces = filter.get_forces()  # type: ignore
+        forces = filter.get_forces() if cell_relax else opt_atoms.get_forces()  # type: ignore
         _fmax = np.sqrt((forces**2).sum(axis=1).max())
         if _fmax > 1000:
             return None
@@ -189,7 +229,10 @@ def create_supercell_if_needed(structure: Atoms, min_interplanar_distance: float
 
     Args:
         structure: The structure to potentially expand into a supercell.
-        min_interplanar_distance: Minimum interplanar distance before constructing a supercell, in angstroms.
+        min_interplanar_distance: Minimum interplanar distance before constructing
+            a supercell, in angstroms. Replication ratios within relative 1e-12
+            of an integer are treated as that integer to make repeated
+            preparation stable against floating-point boundary noise.
 
     Returns:
         The original structure or supercell if expansion was needed.
@@ -205,7 +248,14 @@ def create_supercell_if_needed(structure: Atoms, min_interplanar_distance: float
     plane_distances = np.array([dist_a, dist_b, dist_c])
 
     # Determine supercell dimensions
-    supercell = np.ceil(min_interplanar_distance / plane_distances).astype(int)
+    ratios = min_interplanar_distance / plane_distances
+    nearest_integer = np.rint(ratios)
+    ratios = np.where(
+        np.isclose(ratios, nearest_integer, rtol=1e-12, atol=0.0),
+        nearest_integer,
+        ratios,
+    )
+    supercell = np.ceil(ratios).astype(int)
 
     if np.any(supercell > 1):
         print(
@@ -221,34 +271,71 @@ def bootstrap_ratio_std(
     denominator: np.ndarray,
     n_bootstrap: int,
     random_seed: int,
-) -> float:
-    """Calculate standard deviation of ratio estimator using bootstrap.
+) -> Optional[float]:
+    """Estimate a ratio's sampling standard error with ordinary bootstrap.
 
     Args:
-        numerator: Array of numerator values.
-        denominator: Array of denominator values.
-        n_bootstrap: Number of bootstrap samples.
-        random_seed: Seed for the random number generator.
+        numerator: Nonempty one-dimensional finite numerator observations.
+        denominator: Matching finite nonnegative denominator observations,
+            with positive total weight.
+        n_bootstrap: Number of bootstrap replicates, at least two.
+        random_seed: Seed for the bootstrap random number generator.
 
     Returns:
-        Standard deviation of the ratio estimator.
+        Sample standard deviation of the replicate ratios, or None when fewer
+        than two observations are available or a resample has zero total
+        weight. Such resamples are not discarded or redrawn.
+
+    Raises:
+        ValueError: If observations or the replicate count are unsupported.
+
+    Warns:
+        RuntimeWarning: If the ratio uncertainty cannot be estimated.
     """
+    numerator = np.asarray(numerator, dtype=float)
+    denominator = np.asarray(denominator, dtype=float)
+    if (
+        numerator.ndim != 1
+        or denominator.ndim != 1
+        or numerator.shape != denominator.shape
+        or numerator.size == 0
+    ):
+        raise ValueError("Bootstrap observations must be nonempty matching 1D arrays.")
+    if (
+        not np.isfinite(numerator).all()
+        or not np.isfinite(denominator).all()
+        or np.any(denominator < 0)
+        or not np.any(denominator > 0)
+    ):
+        raise ValueError(
+            "Bootstrap observations need finite values and nonnegative, positive-total weights."
+        )
+    if n_bootstrap < 2:
+        raise ValueError("n_bootstrap must be at least two.")
+
     n = len(numerator)
-    ratios = np.zeros(n_bootstrap)
+    if n < 2:
+        warnings.warn(
+            "Uncertainty requires at least two insertion attempts; standard errors are unavailable.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
 
+    ratios = np.empty(n_bootstrap)
     rng = np.random.default_rng(random_seed)
-
     for i in range(n_bootstrap):
-        # Generate bootstrap sample indices (with replacement)
         indices = rng.choice(n, size=n, replace=True)
-
-        # Calculate ratio for this bootstrap sample
-        num_sample = numerator[indices]
-        denom_sample = denominator[indices]
-        ratios[i] = num_sample.mean() / denom_sample.mean()
-
-    # Return standard deviation of bootstrap ratios
-    return float(np.std(ratios))
+        total_weight = denominator[indices].sum()
+        if total_weight == 0:
+            warnings.warn(
+                "Bootstrap resample has zero total weight; ratio standard error is unavailable.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return None
+        ratios[i] = numerator[indices].sum() / total_weight
+    return float(np.std(ratios, ddof=1))
 
 
 def calculate_atomic_density(atoms: Atoms) -> float:
